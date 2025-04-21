@@ -1,6 +1,5 @@
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
+const fs = require('fs/promises');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const colors = {
@@ -31,16 +30,24 @@ const emojis = {
   change: '🔄'
 };
 
+// Proxy format regex patterns (adapted from Python code)
+const PROXY_FORMATS_REGEXP = [
+  // Format 1: [protocol://]login:password@host:port[refresh_url]
+  /^(?:(?<protocol>.+):\/\/)?(?<login>[^@:]+):(?<password>[^@]+)[@](?<host>[^@:\s]+):(?<port>\d{1,5})(?:\[(?<refresh_url>https?:\/\/[^\s\]]+)\])?$/,
+  // Format 2: [protocol://]host:port@login:password[refresh_url]
+  /^(?:(?<protocol>.+):\/\/)?(?<host>[^@:\s]+):(?<port>\d{1,5})[@](?<login>[^@:]+):(?<password>[^@]+)(?:\[(?<refresh_url>https?:\/\/[^\s\]]+)\])?$/,
+  // Format 3: [protocol://]host:port[refresh_url]
+  /^(?:(?<protocol>.+):\/\/)?(?<host>[^@:\s]+):(?<port>\d{1,5})(?:\[(?<refresh_url>https?:\/\/[^\s\]]+)\])?$/
+];
+
 let tokens = [];
 let proxies = [];
 let currentTokenIndex = 0;
 let currentProxyIndex = 0;
 
-function loadTokens() {
+async function loadTokens() {
   try {
-    const tokenPath = path.join(__dirname, 'token.txt');
-    const tokenContent = fs.readFileSync(tokenPath, 'utf8');
-
+    const tokenContent = await fs.readFile('token.txt', 'utf8');
     const tokenList = tokenContent.split('\n')
       .map(token => token.trim())
       .filter(token => token.length > 0);
@@ -59,20 +66,14 @@ function loadTokens() {
   }
 }
 
-function loadProxies() {
+async function loadProxies() {
   try {
-    const proxyPath = path.join(__dirname, 'proxies.txt');
-
-    if (!fs.existsSync(proxyPath)) {
-      console.log(`${colors.yellow}${emojis.warning} proxies.txt not found. Running without proxies.${colors.reset}`);
-      return [];
-    }
-    
-    const proxyContent = fs.readFileSync(proxyPath, 'utf8');
-
+    const proxyContent = await fs.readFile('proxies.txt', 'utf8');
     const proxyList = proxyContent.split('\n')
       .map(proxy => proxy.trim())
-      .filter(proxy => proxy.length > 0);
+      .filter(proxy => proxy.length > 0)
+      .map(parseProxy)
+      .filter(proxy => proxy !== null);
     
     if (proxyList.length > 0) {
       console.log(`${colors.green}${emojis.network} Loaded ${colors.bright}${proxyList.length}${colors.reset}${colors.green} proxies from proxies.txt${colors.reset}`);
@@ -88,41 +89,80 @@ function loadProxies() {
   }
 }
 
+function parseProxy(proxyString) {
+  try {
+    if (!proxyString) {
+      throw new Error('Proxy cannot be an empty string');
+    }
+
+    for (const pattern of PROXY_FORMATS_REGEXP) {
+      const match = proxyString.match(pattern);
+      if (match) {
+        const groups = match.groups;
+        const port = parseInt(groups.port);
+        
+        // Validate port
+        if (port < 1 || port > 65535) {
+          throw new Error(`Invalid port: ${port}. Must be between 1 and 65535`);
+        }
+
+        // Validate host (basic IP or domain check)
+        const host = groups.host;
+        const ipRegex = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+        const domainRegex = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+        if (!ipRegex.test(host) && !domainRegex.test(host)) {
+          throw new Error(`Invalid host: ${host}. Must be a valid IP or domain`);
+        }
+
+        // Validate protocol (if provided)
+        const protocol = groups.protocol || 'http';
+        if (!['http', 'https'].includes(protocol)) {
+          throw new Error(`Invalid protocol: ${protocol}. Only http and https are supported`);
+        }
+
+        // Validate refresh_url (if provided)
+        if (groups.refresh_url) {
+          const urlRegex = /^https?:\/\/[^\s]+$/;
+          if (!urlRegex.test(groups.refresh_url)) {
+            throw new Error(`Invalid refresh_url: ${groups.refresh_url}`);
+          }
+        }
+
+        // Format proxy as http://login:password@host:port for https-proxy-agent
+        const formattedProxy = groups.login && groups.password
+          ? `http://${groups.login}:${groups.password}@${host}:${port}`
+          : `http://${host}:${port}`;
+
+        return {
+          formattedProxy,
+          original: proxyString,
+          refresh_url: groups.refresh_url || null
+        };
+      }
+    }
+
+    throw new Error(`Unsupported proxy format: ${proxyString}`);
+  } catch (error) {
+    console.error(`${colors.red}${emojis.error} Error parsing proxy ${proxyString}:${colors.reset}`, error.message);
+    fs.appendFile('failed_proxies.txt', `${proxyString}\n`, () => {});
+    return null;
+  }
+}
+
 function getNextToken() {
   const token = tokens[currentTokenIndex];
   currentTokenIndex = (currentTokenIndex + 1) % tokens.length;
   return token;
 }
 
-function getRandomProxy() {
+function getNextProxy() {
   if (proxies.length === 0) return null;
-  
   const proxy = proxies[currentProxyIndex];
   currentProxyIndex = (currentProxyIndex + 1) % proxies.length;
   return proxy;
 }
 
-function createProxyAgent(proxyString) {
-  if (!proxyString) return null;
-
-  let formattedProxy = proxyString;
-
-  if (proxyString.includes('@') && !proxyString.startsWith('http')) {
-    formattedProxy = `http://${proxyString}`;
-  } 
-  else if (!proxyString.includes('@') && !proxyString.startsWith('http')) {
-    formattedProxy = `http://${proxyString}`;
-  }
-  
-  try {
-    return new HttpsProxyAgent(formattedProxy);
-  } catch (error) {
-    console.error(`${colors.red}${emojis.error} Error creating proxy agent for ${proxyString}:${colors.reset}`, error.message);
-    return null;
-  }
-}
-
-function createAxiosInstance(token, proxyString = null) {
+function createAxiosInstance(token, proxy = null) {
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
@@ -141,17 +181,23 @@ function createAxiosInstance(token, proxyString = null) {
     'referer': 'https://app.flow3.tech/',
     'priority': 'u=1, i'
   };
-  
-  const axiosConfig = { headers };
 
-  if (proxyString) {
-    const proxyAgent = createProxyAgent(proxyString);
-    if (proxyAgent) {
-      axiosConfig.httpsAgent = proxyAgent;
-      console.log(`${colors.cyan}${emojis.network} Using proxy: ${colors.bright}${proxyString}${colors.reset}`);
-    }
+  const axiosConfig = {
+    headers,
+    httpsAgent: proxy ? new HttpsProxyAgent(proxy.formattedProxy, {
+      minVersion: 'TLSv1.2', // Force TLS 1.2 or higher
+      rejectUnauthorized: true // Enforce strict SSL verification
+    }) : new require('https').Agent({
+      minVersion: 'TLSv1.2' // Ensure TLS 1.2 for non-proxy requests
+    })
+  };
+
+  if (proxy) {
+    console.log(`${colors.cyan}${emojis.network} Using proxy: ${colors.bright}${proxy.formattedProxy}${colors.reset}${proxy.refresh_url ? ` [${proxy.refresh_url}]` : ''}`);
+  } else {
+    console.log(`${colors.yellow}${emojis.warning} No proxy used for this request${colors.reset}`);
   }
-  
+
   return axios.create(axiosConfig);
 }
 
@@ -161,7 +207,7 @@ function printBanner() {
     `${colors.cyan}${colors.reset}  ${colors.bright}${colors.white}FLOW3 AUTO TASK - AIRDROP INSIDERS${colors.reset}  ${colors.cyan}${colors.reset}`,
     `${colors.cyan}----------------------------------------${colors.reset}`
   ];
-  
+
   console.log('\n' + bannerLines.join('\n') + '\n');
 }
 
@@ -197,7 +243,7 @@ async function claimTask(axiosInstance, taskId) {
       'https://api2.flow3.tech/api/task/claim-task',
       { taskId }
     );
-    
+
     if (response.data.result === 'success') {
       console.log(`${colors.green}${emojis.success} Task ${taskId} claimed successfully!${colors.reset}`);
       return true;
@@ -219,7 +265,7 @@ function printPointStats(stats, tokenIndex) {
     console.log(`${colors.yellow}${emojis.warning} No point stats available for token #${tokenIndex + 1}${colors.reset}`);
     return;
   }
-  
+
   console.log(`\n${colors.cyan}${emojis.money} BALANCE INFORMATION (TOKEN #${tokenIndex + 1}) ${emojis.money}${colors.reset}`);
   console.log(`${colors.cyan}------------------------------------------${colors.reset}`);
   console.log(`${colors.white}${emojis.star} Total Points:         ${colors.green}${stats.totalPointEarned.toFixed(2)}${colors.reset}`);
@@ -232,72 +278,89 @@ function printPointStats(stats, tokenIndex) {
 }
 
 async function processTokenTasks(token, tokenIndex, useProxy = true) {
-  try {
-    console.log(`\n${colors.white}${emojis.key} Processing Token #${tokenIndex + 1}${colors.reset}`);
+  let attempts = 0;
+  const maxAttempts = useProxy ? proxies.length || 1 : 1;
+  let proxyFailed = false;
 
-    let proxy = null;
-    if (useProxy && proxies.length > 0) {
-      proxy = getRandomProxy();
-    }
+  while (attempts < maxAttempts) {
+    try {
+      console.log(`\n${colors.white}${emojis.key} Processing Token #${tokenIndex + 1}${colors.reset}`);
 
-    const axiosInstance = createAxiosInstance(token, proxy);
+      const proxy = useProxy ? getNextProxy() : null;
+      const axiosInstance = createAxiosInstance(token, proxy);
 
-    const tasks = await getTasks(axiosInstance);
-    console.log(`${colors.white}${emojis.info} Found ${colors.yellow}${tasks.length}${colors.white} tasks for token #${tokenIndex + 1}${colors.reset}`);
-    
-    let claimedCount = 0;
-    let failedCount = 0;
-    let alreadyClaimedCount = 0;
+      const tasks = await getTasks(axiosInstance);
+      console.log(`${colors.white}${emojis.info} Found ${colors.yellow}${tasks.length}${colors.white} tasks for token #${tokenIndex + 1}${colors.reset}`);
 
-    for (const task of tasks) {
-      const statusColor = 
-        task.status === 'idle' ? colors.yellow :
-        task.status === 'pending' ? colors.cyan :
-        task.status === 'claimed' ? colors.green : colors.white;
-      
-      const statusEmoji = 
-        task.status === 'idle' ? emojis.pending :
-        task.status === 'pending' ? emojis.pending :
-        task.status === 'claimed' ? emojis.success : emojis.info;
-        
-      console.log(`${colors.white}${emojis.info} Processing: ${colors.bright}${task.name}${colors.reset} ${colors.white}(${statusColor}${task.status} ${statusEmoji}${colors.white}) - ${colors.green}${task.pointAmount} points${colors.reset}`);
+      let claimedCount = 0;
+      let failedCount = 0;
+      let alreadyClaimedCount = 0;
 
-      const claimResult = await claimTask(axiosInstance, task._id);
-      
-      if (claimResult) {
-        claimedCount++;
-      } else if (task.status === 'claimed') {
-        alreadyClaimedCount++;
-      } else {
-        failedCount++;
+      for (const task of tasks) {
+        const statusColor =
+          task.status === 'idle' ? colors.yellow :
+          task.status === 'pending' ? colors.cyan :
+          task.status === 'claimed' ? colors.green : colors.white;
+
+        const statusEmoji =
+          task.status === 'idle' ? emojis.pending :
+          task.status === 'pending' ? emojis.pending :
+          task.status === 'claimed' ? emojis.success : emojis.info;
+
+        console.log(`${colors.white}${emojis.info} Processing: ${colors.bright}${task.name}${colors.reset} ${colors.white}(${statusColor}${task.status} ${statusEmoji}${colors.white}) - ${colors.green}${task.pointAmount} points${colors.reset}`);
+
+        const claimResult = await claimTask(axiosInstance, task._id);
+
+        if (claimResult) {
+          claimedCount++;
+        } else if (task.status === 'claimed') {
+          alreadyClaimedCount++;
+        } else {
+          failedCount++;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    
-    console.log(`\n${colors.white}${emojis.info} Task processing summary for token #${tokenIndex + 1}:${colors.reset}`);
-    console.log(`${colors.green}${emojis.success} Successfully claimed: ${claimedCount}${colors.reset}`);
-    console.log(`${colors.yellow}${emojis.pending} Already claimed: ${alreadyClaimedCount}${colors.reset}`);
-    console.log(`${colors.red}${emojis.error} Failed to claim: ${failedCount}${colors.reset}`);
+      console.log(`\n${colors.white}${emojis.info} Task processing summary for token #${tokenIndex + 1}:${colors.reset}`);
+      console.log(`${colors.green}${emojis.success} Successfully claimed: ${claimedCount}${colors.reset}`);
+      console.log(`${colors.yellow}${emojis.pending} Already claimed: ${alreadyClaimedCount}${colors.reset}`);
+      console.log(`${colors.red}${emojis.error} Failed to claim: ${failedCount}${colors.reset}`);
 
-    const pointStats = await getPointStats(axiosInstance);
-    printPointStats(pointStats, tokenIndex);
-    
-    return { claimedCount, alreadyClaimedCount, failedCount };
-  } catch (error) {
-    console.error(`${colors.red}${emojis.error} Error processing token #${tokenIndex + 1}:${colors.reset}`, error.message);
-    return { claimedCount: 0, alreadyClaimedCount: 0, failedCount: 0 };
+      const pointStats = await getPointStats(axiosInstance);
+      printPointStats(pointStats, tokenIndex);
+
+      return { claimedCount, alreadyClaimedCount, failedCount };
+    } catch (error) {
+      console.error(`${colors.red}${emojis.error} Attempt ${attempts + 1} failed for token #${tokenIndex + 1}:${colors.reset}`, error.message);
+      if (proxy) {
+        fs.appendFile('failed_proxies.txt', `${proxy.original}\n`, () => {});
+      }
+      attempts++;
+      if (attempts < maxAttempts) {
+        console.log(`${colors.yellow}${emojis.pending} Retrying with a different proxy...${colors.reset}`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else if (useProxy && !proxyFailed) {
+        console.log(`${colors.yellow}${emojis.warning} All proxies failed. Retrying without proxy...${colors.reset}`);
+        proxyFailed = true;
+        attempts = 0;
+        useProxy = false;
+      } else {
+        console.error(`${colors.red}${emojis.error} All attempts failed for token #${tokenIndex + 1}${colors.reset}`);
+        return { claimedCount: 0, alreadyClaimedCount: 0, failedCount: 0 };
+      }
+    }
   }
 }
 
-function reloadTokensAndProxies() {
+async function reloadTokensAndProxies() {
   try {
-    const newTokens = loadTokens();
-    const newProxies = loadProxies();
+    const newTokens = await loadTokens();
+    const newProxies = await loadProxies();
 
     tokens = newTokens;
     proxies = newProxies;
-    
+
     console.log(`${colors.green}${emojis.change} Tokens and proxies reloaded successfully${colors.reset}`);
     return true;
   } catch (error) {
@@ -310,18 +373,18 @@ async function runBot() {
   printBanner();
   console.log(`${colors.green}${emojis.rocket} Starting Flow3 Multi-Token Task Bot...${colors.reset}`);
 
-  tokens = loadTokens();
-  proxies = loadProxies();
-  
+  tokens = await loadTokens();
+  proxies = await loadProxies();
+
   let cycleCount = 1;
-  
+
   while (true) {
     try {
       console.log(`\n${colors.white}${emojis.time} Starting cycle #${cycleCount}${colors.reset}`);
       console.log(`${colors.white}${'-'.repeat(50)}${colors.reset}`);
 
-      reloadTokensAndProxies();
-      
+      await reloadTokensAndProxies();
+
       let totalClaimed = 0;
       let totalAlreadyClaimed = 0;
       let totalFailed = 0;
@@ -352,8 +415,8 @@ async function runBot() {
         process.stdout.write(`\r${colors.yellow}${emojis.time} Next cycle in: ${colors.bright}${i}${colors.reset} seconds`);
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
-      process.stdout.write('\r' + ' '.repeat(60) + '\r'); 
-      
+      process.stdout.write('\r' + ' '.repeat(60) + '\r');
+
       cycleCount++;
     } catch (error) {
       console.error(`${colors.red}${emojis.error} Error in main bot loop:${colors.reset}`, error.message);
