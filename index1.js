@@ -45,7 +45,7 @@ let proxies = [];
 let currentTokenIndex = 0;
 let currentProxyIndex = 0;
 
-const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY || '';
+const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY || 'CAP-9814922C5E977C174E54006C7189D3CF9864F81F6C3A04C4CF3ABC91D1338BDB';
 const SITE_KEY = '0x4AAAAAABDpOwOAt5nJkp9b';
 const PAGE_URL = 'https://app.flow3.tech';
 const DEFAULT_REFERRAL_CODE = 'SKvUHwtgvy';
@@ -124,21 +124,31 @@ async function loadTokens(filePath) {
       .filter(line => line.length > 0)
       .map((line, index) => {
         try {
-          // For newtoken.txt, expect JSON: {"token":"...","email":"...","password":"...","walletAddress":"..."?}
           if (filePath === 'newtoken.txt') {
             const parsed = JSON.parse(line);
             if (!parsed.token || !parsed.email || !parsed.password) {
               throw new Error('Missing token, email, or password');
             }
+            if (parsed.privateKey) {
+              try {
+                const decodedKey = Buffer.from(parsed.privateKey, 'base64');
+                if (decodedKey.length !== 64) {
+                  throw new Error('Invalid Solana private key length');
+                }
+              } catch (error) {
+                console.error(`${colors.red}${emojis.error} Invalid privateKey in ${filePath} at line ${index + 1}:${colors.reset}`, error.message);
+                parsed.privateKey = null;
+              }
+            }
             return {
               token: parsed.token,
               email: parsed.email,
               password: parsed.password,
-              walletAddress: parsed.walletAddress || null
+              walletAddress: parsed.walletAddress || null,
+              privateKey: parsed.privateKey || null
             };
           }
-          // For token.txt, treat as raw token
-          return { token: line, email: `Token_${index + 1}`, password: null, walletAddress: null };
+          return { token: line, email: `Token_${index + 1}`, password: null, walletAddress: null, privateKey: null };
         } catch (error) {
           console.error(`${colors.red}${emojis.error} Invalid line in ${filePath} at line ${index + 1}:${colors.reset}`, error.message);
           return null;
@@ -307,7 +317,7 @@ async function createAccount(capsolver, referralCode) {
 
     if (response.data.result === 'success' && response.data.data.accessToken) {
       console.log(`${colors.green}${emojis.success} Account created successfully: ${colors.bright}${email}${colors.reset}`);
-      const entry = { token: response.data.data.accessToken, email, password, walletAddress: null };
+      const entry = { token: response.data.data.accessToken, email, password, walletAddress: null, privateKey: null };
       await fs.appendFile('newtoken.txt', `${JSON.stringify(entry)}\n`);
       return entry;
     } else {
@@ -329,18 +339,18 @@ function createAxiosInstance(token, proxy = null) {
     'Accept': 'application/json, text/plain, */*',
     'Accept-Encoding': 'gzip, deflate, br, zstd',
     'Content-Type': 'application/json',
-    'sec-ch-ua-platform': 'Windows',
-    'authorization': `Bearer ${token}`,
+    'Authorization': `Bearer ${token}`,
+    'sec-ch-ua-platform': '"Windows"',
     'sec-ch-ua': '"Brave";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
     'sec-ch-ua-mobile': '?0',
     'sec-gpc': '1',
-    'accept-language': 'en-US,en;q=0.5',
+    'accept-language': 'en-US,en;q=0.7',
     'origin': 'https://app.flow3.tech',
+    'referer': 'https://app.flow3.tech/',
+    'priority': 'u=1, i',
     'sec-fetch-site': 'same-site',
     'sec-fetch-mode': 'cors',
-    'sec-fetch-dest': 'empty',
-    'referer': 'https://app.flow3.tech/',
-    'priority': 'u=1, i'
+    'sec-fetch-dest': 'empty'
   };
 
   const axiosConfig = {
@@ -363,68 +373,100 @@ function createAxiosInstance(token, proxy = null) {
 }
 
 async function connectSolanaWallet(axiosInstance, tokenEntry, tokenIndex) {
-  const { token, email, walletAddress } = tokenEntry;
+  const { token, email, walletAddress, privateKey } = tokenEntry;
 
-  // Skip if walletAddress is already set and valid
-  if (walletAddress && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(walletAddress)) {
-    console.log(`${colors.green}${emojis.wallet} Solana wallet already linked for ${email}: ${walletAddress}${colors.reset}`);
-    return true;
+  // Skip if walletAddress and privateKey are set and valid
+  if (walletAddress && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(walletAddress) && privateKey) {
+    try {
+      const decodedKey = Buffer.from(privateKey, 'base64');
+      if (decodedKey.length === 64) {
+        console.log(`${colors.green}${emojis.wallet} Solana wallet already linked for ${email}: ${walletAddress}${colors.reset}`);
+        return true;
+      }
+    } catch (error) {
+      console.log(`${colors.yellow}${emojis.warning} Invalid privateKey for ${email}. Generating new wallet...${colors.reset}`);
+    }
   }
 
-  console.log(`${colors.yellow}${emojis.pending} No Solana wallet linked for ${email}. Generating new wallet...${colors.reset}`);
+  console.log(`${colors.yellow}${emojis.pending} No valid Solana wallet linked for ${email}. Generating new wallet...${colors.reset}`);
 
   // Generate new Solana wallet
   try {
     const keypair = Keypair.generate();
     const newWalletAddress = keypair.publicKey.toBase58();
-    const privateKey = Buffer.from(keypair.secretKey).toString('base64');
+    const newPrivateKey = Buffer.from(keypair.secretKey).toString('base64');
 
-    console.log(`${colors.cyan}${emojis.wallet} Generated new Solana wallet:${colors.reset}`);
+    console.log(`${colors.cyan}${emojis.wallet} Generated new Solana wallet for ${email}:${colors.reset}`);
     console.log(`${colors.cyan}  Public Key: ${colors.bright}${newWalletAddress}${colors.reset}`);
-    console.log(`${colors.yellow}  Private Key: ${colors.bright}${privateKey}${colors.reset} (Save securely, not stored in newtoken.txt)`);
+    console.log(`${colors.yellow}  Private Key: ${colors.bright}${newPrivateKey}${colors.reset} (Also saved in newtoken.txt, store securely)`);
+    console.log(`${colors.red}${emojis.warning} WARNING: newtoken.txt contains sensitive privateKey data. Store it securely and back up regularly.${colors.reset}`);
 
-    // Connect wallet via API
+    // Connect wallet via API with retry
     const payload = { walletAddress: newWalletAddress };
-    const response = await axiosInstance.post('https://api2.flow3.tech/api/user/update-wallet-address', payload);
+    let attempts = 0;
+    const maxAttempts = 2;
 
-    if (response.data.result === 'success') {
-      console.log(`${colors.green}${emojis.success} Solana wallet ${newWalletAddress} linked successfully for ${email}${colors.reset}`);
-
-      // Update newtoken.txt with new walletAddress
+    while (attempts < maxAttempts) {
       try {
-        const tokenContent = await fs.readFile('newtoken.txt', 'utf8');
-        const tokenLines = tokenContent.split('\n').filter(line => line.trim());
-        const updatedLines = tokenLines.map(line => {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.token === token && parsed.email === email) {
-              return JSON.stringify({ ...parsed, walletAddress: newWalletAddress });
-            }
-            return line;
-          } catch (error) {
-            return line;
-          }
+        const response = await axiosInstance.post('https://api2.flow3.tech/api/user/update-wallet-address', payload, {
+          validateStatus: status => status >= 200 && status < 500 // Accept 2xx and 4xx for detailed logging
         });
 
-        await fs.writeFile('newtoken.txt', updatedLines.join('\n') + '\n');
-        console.log(`${colors.green}${emojis.success} Updated newtoken.txt with walletAddress for ${email}${colors.reset}`);
+        if (response.status === 201 && response.data.result === 'success') {
+          console.log(`${colors.green}${emojis.success} Solana wallet ${newWalletAddress} linked successfully for ${email}${colors.reset}`);
 
-        // Update in-memory token entry
-        tokenEntry.walletAddress = newWalletAddress;
-        return true;
+          // Update newtoken.txt with new walletAddress and privateKey
+          try {
+            const tokenContent = await fs.readFile('newtoken.txt', 'utf8');
+            const tokenLines = tokenContent.split('\n').filter(line => line.trim());
+            const updatedLines = tokenLines.map(line => {
+              try {
+                const parsed = JSON.parse(line);
+                if (parsed.token === token && parsed.email === email) {
+                  return JSON.stringify({ ...parsed, walletAddress: newWalletAddress, privateKey: newPrivateKey });
+                }
+                return line;
+              } catch (error) {
+                return line;
+              }
+            });
+
+            await fs.writeFile('newtoken.txt', updatedLines.join('\n') + '\n');
+            console.log(`${colors.green}${emojis.success} Updated newtoken.txt with walletAddress and privateKey for ${email}${colors.reset}`);
+
+            // Update in-memory token entry
+            tokenEntry.walletAddress = newWalletAddress;
+            tokenEntry.privateKey = newPrivateKey;
+            return true;
+          } catch (error) {
+            console.error(`${colors.red}${emojis.error} Error updating newtoken.txt:${colors.reset}`, error.message);
+            return false;
+          }
+        } else {
+          console.error(`${colors.red}${emojis.error} Failed to link Solana wallet for ${email}. Status: ${response.status}, Response:${colors.reset}`, response.data);
+          attempts++;
+          if (attempts < maxAttempts) {
+            console.log(`${colors.yellow}${emojis.pending} Retrying API call (${attempts + 1}/${maxAttempts})...${colors.reset}`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
       } catch (error) {
-        console.error(`${colors.red}${emojis.error} Error updating newtoken.txt:${colors.reset}`, error.message);
-        return false;
+        console.error(`${colors.red}${emojis.error} Error during API call to link Solana wallet for ${email}:${colors.reset}`, error.message);
+        if (error.response) {
+          console.error(`${colors.red}Error details - Status: ${error.response.status}, Data:${colors.reset}`, error.response.data);
+        }
+        attempts++;
+        if (attempts < maxAttempts) {
+          console.log(`${colors.yellow}${emojis.pending} Retrying API call (${attempts + 1}/${maxAttempts})...${colors.reset}`);
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
       }
-    } else {
-      console.error(`${colors.red}${emojis.error} Failed to link Solana wallet for ${email}:${colors.reset}`, response.data);
-      return false;
     }
+
+    console.error(`${colors.red}${emojis.error} All attempts to link Solana wallet for ${email} failed${colors.reset}`);
+    return false;
   } catch (error) {
     console.error(`${colors.red}${emojis.error} Error generating or linking Solana wallet for ${email}:${colors.reset}`, error.message);
-    if (error.response) {
-      console.error(`${colors.red}Error details:${colors.reset}`, error.response.data);
-    }
     return false;
   }
 }
@@ -518,7 +560,6 @@ async function processTokenTasks(tokenEntry, tokenIndex, useProxy = true) {
       const proxy = useProxy ? getNextProxy() : null;
       const axiosInstance = createAxiosInstance(token, proxy);
 
-      // Process existing tasks (retweet, like, comment, etc.)
       const tasks = await getTasks(axiosInstance);
       console.log(`${colors.white}${emojis.info} Found ${colors.yellow}${tasks.length}${colors.white} tasks for token #${tokenIndex + 1} (${email})${colors.reset}`);
 
@@ -557,7 +598,6 @@ async function processTokenTasks(tokenEntry, tokenIndex, useProxy = true) {
       console.log(`${colors.yellow}${emojis.pending} Already claimed: ${alreadyClaimedCount}${colors.reset}`);
       console.log(`${colors.red}${emojis.error} Failed to claim: ${failedCount}${colors.reset}`);
 
-      // Process Solana wallet connection task
       console.log(`${colors.white}${emojis.wallet} Checking Solana wallet connection for ${email}...${colors.reset}`);
       const walletConnected = await connectSolanaWallet(axiosInstance, tokenEntry, tokenIndex);
       if (!walletConnected) {
